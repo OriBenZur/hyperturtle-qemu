@@ -18,6 +18,9 @@
 #include <poll.h>
 
 #include <linux/kvm.h>
+#include <linux/bpf.h>
+#include <bpf/libbpf.h>
+#include "monitor/qdev.h"
 
 #include "qemu/atomic.h"
 #include "qemu/option.h"
@@ -49,6 +52,10 @@
 
 #include "hw/boards.h"
 #include "monitor/stats.h"
+
+#include "qapi/qmp/qdict.h"
+#include "include/hw/qdev-core.h"
+#include "include/qom/object_interfaces.h"
 
 /* This check must be after config-host.h is included */
 #ifdef CONFIG_EVENTFD
@@ -135,6 +142,66 @@ static QemuMutex kml_slots_lock;
 #define kvm_slots_unlock()  qemu_mutex_unlock(&kml_slots_lock)
 
 static void kvm_slot_init_dirty_bitmap(KVMSlot *mem);
+
+
+
+#define MAX_NUM_HYPERUPCALL_OBJS 16
+#define HYPERUPCALL_N_PROGRAM_SLOTS 8
+#define HYPERUPCALL_N_MAP_SLOTS 8
+#define HYPERUPCALL_PROG_NAME_LEN 1024
+#define HYPERUPCALL_MAX_N_MEMSLOTS 128
+
+
+enum {
+    HYPERUPCALL_MAJORID_XDP = 0,
+    HYPERUPCALL_MAJORID_PAGEFAULT,
+    HYPERUPCALL_MAJORID_TC_EGRESS,
+    HYPERUPCALL_MAJORID_DIRECT_EXE,
+    HYPERUPCALL_MAJORID_MAX,
+};
+
+
+/**
+ * Struct to hold hyperupcall information. Temporarily holds one link.
+ * 
+ * @obj: BPF object.
+ * @nr_attachments: number of BPF programs.
+ * @links: array of BPF link ptrs.
+ * @hooks: array of BPF hook ptrs. either links or hooks are used for a specific program, not both.
+ * @progs: array of BPF program ptrs. progs[i] holds the program for links[i]. Duplicates may occur.
+ * @major_ids: array of major IDs.
+ * @minor_ids: array of minor IDs.
+ * 
+ * @lock: lock to protect hyperupcall struct. Currently not in use - use global hyperupcalls_lock instead.
+*/
+struct HyperUpCall {
+    struct bpf_object *obj;
+	struct bpf_link *links[HYPERUPCALL_N_PROGRAM_SLOTS];
+    struct bpf_tc_hook hooks[HYPERUPCALL_N_PROGRAM_SLOTS];
+    struct bpf_program *progs[HYPERUPCALL_N_PROGRAM_SLOTS];
+    int major_ids[HYPERUPCALL_N_PROGRAM_SLOTS];
+    int minor_ids[HYPERUPCALL_N_PROGRAM_SLOTS];
+    void *mmaped_map_ptrs[HYPERUPCALL_N_MAP_SLOTS];
+    struct bpf_map *maps[HYPERUPCALL_N_MAP_SLOTS];
+    
+
+    pthread_mutex_t lock;
+};
+
+static const char * const memory_backend_ids[HYPERUPCALL_N_MAP_SLOTS] = {"hp0", "hp1", "hp2", "hp3", "hp4", "hp5", "hp6", "hp7"};
+static const char * const memory_backend_names[HYPERUPCALL_N_MAP_SLOTS] = {"bpf_map_obj0", "bpf_map_obj1", "bpf_map_obj2", "bpf_map_obj3", "bpf_map_obj4", "bpf_map_obj5", "bpf_map_obj6", "bpf_map_obj7"};
+static const char * const memory_devices_names[HYPERUPCALL_N_MAP_SLOTS] = {"bpf_map_dev0", "bpf_map_dev1", "bpf_map_dev2", "bpf_map_dev3", "bpf_map_dev4", "bpf_map_dev5", "bpf_map_dev6", "bpf_map_dev7"};
+static unsigned short used_memslots;
+static unsigned long long memslot_base_gfns_local[HYPERUPCALL_MAX_N_MEMSLOTS];
+static unsigned long long memslot_npages_local[HYPERUPCALL_MAX_N_MEMSLOTS];
+static unsigned long long memslot_userptrs_local[HYPERUPCALL_MAX_N_MEMSLOTS];
+static unsigned int memslot_as_id[HYPERUPCALL_MAX_N_MEMSLOTS];
+
+static const char *memory_backend_bh = NULL;
+
+struct HyperUpCall hyperupcalls[MAX_NUM_HYPERUPCALL_OBJS] = {0};
+pthread_mutex_t hyperupcalls_lock;
+
 
 static inline void kvm_resample_fd_remove(int gsi)
 {
@@ -314,7 +381,34 @@ err:
                      " start=0x%" PRIx64 ", size=0x%" PRIx64 ": %s",
                      __func__, mem.slot, slot->start_addr,
                      (uint64_t)mem.memory_size, strerror(errno));
+        return ret;
     }
+
+
+    if (slot->slot >= HYPERUPCALL_MAX_N_MEMSLOTS) {
+        fprintf(stderr, "No more memslots available. Need %d memslots\n", slot->slot);
+        return ret;
+    }
+
+    used_memslots = used_memslots < slot->slot ? slot->slot : used_memslots;
+    // if (slot->memory_size == 0) { // remove slot
+    //     memslot_base_gfns_local[slot->slot] = 0;
+    //     memslot_npages_local[slot->slot] = 0;
+    //     memslot_userptrs_local[slot->slot] = 0;
+    //     memslot_as_id[slot->slot] = 0;
+    // }
+    // else if (memslot_npages_local[slot->slot] != 0) { // extend slot
+    //     memslot_npages_local[slot->slot] += (unsigned long long)mem.memory_size >> 12;
+    // }
+    // else { // new slot
+    //     if (memslot_as_id[slot->slot] != kml->as_id && memslot_userptrs_local[slot->slot] != 0 && mem.memory_size != 0) {
+    //         fprintf(stderr, "Slot %d already in use by as_id %d\n", slot->slot, memslot_as_id[slot->slot]);
+    //     }
+    //     memslot_as_id[slot->slot] = kml->as_id;
+    //     memslot_npages_local[slot->slot] = (unsigned long long)mem.memory_size >> 12;
+    //     memslot_base_gfns_local[slot->slot] = (unsigned long long)mem.guest_phys_addr >> 12;
+    //     memslot_userptrs_local[slot->slot] = (unsigned long long)mem.userspace_addr;
+    // }
     return ret;
 }
 
@@ -1327,6 +1421,7 @@ static void kvm_set_phys_mem(KVMMemoryListener *kml,
     ram_start_offset = memory_region_get_ram_addr(mr) + mr_offset;
 
     kvm_slots_lock();
+    int i = 0;
 
     if (!add) {
         do {
@@ -1362,6 +1457,13 @@ static void kvm_set_phys_mem(KVMMemoryListener *kml,
             mem->dirty_bmap = NULL;
             mem->memory_size = 0;
             mem->flags = 0;
+            if (mem->slot < HYPERUPCALL_MAX_N_MEMSLOTS && memslot_npages_local[mem->slot] != 0 && mem->as_id == 0) {
+                fprintf(stderr, "delete: i: %d mem->slot: %d slot_size: %lx start_addr: %lx ram: %p \n", i++, mem->slot, slot_size, start_addr, ram);
+                memslot_as_id[mem->slot] = 0;
+                memslot_npages_local[mem->slot] = 0;
+                memslot_base_gfns_local[mem->slot] = 0;
+                memslot_userptrs_local[mem->slot] = 0;
+            }
             err = kvm_set_user_memory_region(kml, mem, false);
             if (err) {
                 fprintf(stderr, "%s: error unregistering slot: %s\n",
@@ -1375,6 +1477,9 @@ static void kvm_set_phys_mem(KVMMemoryListener *kml,
     }
 
     /* register the new slot */
+    // temp_start_addr = start_addr;
+    // temp_ram = ram;
+    // total_slot_size = size;
     do {
         slot_size = MIN(kvm_max_slot_size, size);
         mem = kvm_alloc_slot(kml);
@@ -1385,6 +1490,17 @@ static void kvm_set_phys_mem(KVMMemoryListener *kml,
         mem->ram = ram;
         mem->flags = kvm_mem_flags(mr);
         kvm_slot_init_dirty_bitmap(mem);
+        if (mem != NULL && mem->slot < HYPERUPCALL_MAX_N_MEMSLOTS && mem->as_id == 0) {
+            fprintf(stderr, "create: i: %d, mem->slot: %d slot_size: %lx start_addr: %lx ram: %p \n", i++, mem->slot, slot_size, start_addr, ram);
+            memslot_as_id[mem->slot] = kml->as_id;
+            memslot_npages_local[mem->slot] = (unsigned long long)slot_size >> 12;
+            memslot_base_gfns_local[mem->slot] = (unsigned long long)start_addr >> 12;
+            memslot_userptrs_local[mem->slot] = (unsigned long long)ram;
+        }
+        else {
+            fprintf(stderr, "kvm_set_phys_mem: mem->slot %d exceeds HYPERUPCALL_MAX_N_MEMSLOTS %d\n",
+                    mem->slot, HYPERUPCALL_MAX_N_MEMSLOTS);
+        }
         err = kvm_set_user_memory_region(kml, mem, true);
         if (err) {
             fprintf(stderr, "%s: error registering slot: %s\n", __func__,
@@ -2609,6 +2725,8 @@ static int kvm_init(MachineState *ms)
                             query_stats_schemas_cb);
     }
 
+    /* To allocate maps on launch, do it here Ori */
+
     return 0;
 
 err:
@@ -2808,12 +2926,700 @@ static void kvm_eat_signals(CPUState *cpu)
     } while (sigismember(&chkset, SIG_IPI));
 }
 
+//TODO: add bounds checking to memory copies?
+
+/**
+ * Called must hold hyperupcalls lock.
+ * @return: slot number on success, -1 on failure.
+*/
+static int allocate_hyperupcall_slot(void) {
+    int slot = -1;
+    for (int i = 0; i < MAX_NUM_HYPERUPCALL_OBJS; i++) {
+        if (hyperupcalls[i].obj == NULL) {
+            slot = i;
+            break;
+        }
+    }
+    return slot;
+}
+
+/**
+ * Called must hold hyperupcalls lock.
+ * @return: slot number on success, -1 on failure.
+*/
+static int allocate_hyperupcall_map_slot(void) {
+    int slot = -1;
+    for (int i = 0; i < HYPERUPCALL_N_MAP_SLOTS; i++) {
+        if (hyperupcalls->maps[i] == NULL) {
+            slot = i;
+            break;
+        }
+    }
+    return slot;
+}
+
+/**
+ * Called must hold hyperupcalls lock.
+ * @return: 0 on success, -1 on failure.
+*/
+static int free_hyperupcall_map_slot(int slot) {
+    if (slot >= HYPERUPCALL_N_MAP_SLOTS) {
+        fprintf(stderr, "Invalid hyperupcall map slot: %d\n", slot);
+        return -1;
+    }
+    if (hyperupcalls->maps[slot] == NULL) {
+        fprintf(stderr, "Hyperupcall map slot is already free: %d\n", slot);
+        return -1;
+    }
+    hyperupcalls->maps[slot] = NULL;
+    hyperupcalls->mmaped_map_ptrs[slot] = NULL;
+    return 0;
+}
+
+static int allocate_hyperupcall_prog_slot(struct HyperUpCall *hyperupcall) {
+    int slot = -1;
+    for (int i = 0; i < HYPERUPCALL_N_PROGRAM_SLOTS; i++) {
+        if (hyperupcalls->progs[i] == NULL) {
+            slot = i;
+            break;
+        }
+    }
+    return slot;
+}
+
+
+/**
+ * Loads hyperupcall from guest to host. Currently only supports one program.
+ * Called must hold the hyperupcall Lock
+ * TODO: Add support for multiple programs.
+ *
+ * @cpu: CPUState
+ * @attrs: MemTxAttrs
+ * @program_ptr_arr: Physical address of array of physical addresses to pages containing the program
+ * @program_len: Length of program in bytes
+ * @returns: hyperupcall index on success, -1 on failure.
+ */
+static int load_hyperupcall(CPUState *cpu, MemTxAttrs attrs, unsigned long program_ptr_arr, unsigned long program_len) {
+    int hyperupcall_slot;
+    struct bpf_object *obj;
+    char *binary;
+    hwaddr binary_gptrs[PAGE_SIZE / sizeof(hwaddr)];
+    int r, program_pages = DIV_ROUND_UP(program_len, PAGE_SIZE);
+    MemTxResult mtr;
+
+    hyperupcall_slot = allocate_hyperupcall_slot();
+    if (hyperupcall_slot < 0) {
+        fprintf(stderr, "No free hyperupcall slots\n");
+        return -1;
+    }
+
+    binary = g_try_malloc0(ROUND_UP(program_len, PAGE_SIZE));
+    if (binary < 0) {
+        fprintf(stderr, "g_malloc0 failed\n");
+        return -1;
+    }
+
+    mtr = address_space_read(cpu->as, program_ptr_arr, MEMTXATTRS_UNSPECIFIED, binary_gptrs, program_pages * sizeof(hwaddr));
+    if (mtr != MEMTX_OK) {
+        fprintf(stderr, "address_space_rw failed %d\n", mtr);
+        g_free(binary);
+        return -1;
+    }
+
+    for (int i = 0; i < program_pages; i++) {
+        mtr = address_space_read(cpu->as, binary_gptrs[i], attrs, binary + (i*PAGE_SIZE), PAGE_SIZE);
+        if (mtr != MEMTX_OK) {
+            fprintf(stderr, "address_space_rw failed %d\n", mtr);
+            g_free(binary);
+            return -1;
+        }
+        fprintf(stderr, "binary[%d]: %p\n", i, binary + (i*PAGE_SIZE));
+    }
+
+
+    obj = bpf_object__open_mem(binary, program_len, NULL);
+    if (obj == NULL) {
+		fprintf(stderr, "Failed to open BPF object file '%lu'\n", program_len);
+        g_free(binary);
+		return -1;
+	}
+
+	r = bpf_object__load(obj);
+	if (r < 0) {
+		fprintf(stderr, "Failed to load BPF object file \n");
+        bpf_object__close(obj);
+        g_free(binary);
+		return -1;
+	}
+
+    hyperupcalls[hyperupcall_slot].obj = obj;
+    g_free(binary);
+    return hyperupcall_slot;
+}
+
+static int export_memslots_hyperupcall(struct bpf_object *obj) {
+    int memslots_base_gfns_fd, memslots_npages_fd, memslots_userptrs_fd;
+    unsigned long long *memslot_base_gfns, *memslot_npages, *memslot_userptrs; 
+    struct bpf_map* memslot_base_gfns_map, *memslot_npages_map, *memslot_userptrs_map;
+
+    memslot_base_gfns_map = bpf_object__find_map_by_name(obj, "l0_memslots_base_gfns");
+    memslot_npages_map = bpf_object__find_map_by_name(obj, "l0_memslots_npages");
+    memslot_userptrs_map = bpf_object__find_map_by_name(obj, "l0_memslots_userspace_addr");
+
+    memslots_base_gfns_fd = bpf_map__fd(memslot_base_gfns_map);
+    memslots_npages_fd = bpf_map__fd(memslot_npages_map);
+    memslots_userptrs_fd = bpf_map__fd(memslot_userptrs_map);
+
+    if (memslots_base_gfns_fd < 0 || memslots_npages_fd < 0 || memslots_userptrs_fd < 0) {
+        if (memslots_base_gfns_fd >= 0) close(memslots_base_gfns_fd);
+        if (memslots_npages_fd >= 0) close(memslots_npages_fd);
+        if (memslots_userptrs_fd >= 0) close(memslots_userptrs_fd);
+        fprintf(stderr, "Failed to get memslots fds\n");
+        return -1;
+    }
+
+    memslot_base_gfns = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, memslots_base_gfns_fd, 0);
+    memslot_npages = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, memslots_npages_fd, 0);
+    memslot_userptrs = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, memslots_userptrs_fd, 0);
+
+    if (memslot_base_gfns == MAP_FAILED || memslot_npages == MAP_FAILED || memslot_userptrs == MAP_FAILED) {
+        fprintf(stderr, "export_memslots_hyperupcall failed\n");
+        if (memslot_base_gfns != MAP_FAILED) munmap(memslot_base_gfns, 4096);
+        if (memslot_npages != MAP_FAILED) munmap(memslot_npages, 4096);
+        if (memslot_userptrs != MAP_FAILED) munmap(memslot_userptrs, 4096);
+        return -1;
+    }
+
+    for (int i = 0; i < used_memslots; i++) {
+        memslot_base_gfns[i] = memslot_base_gfns_local[i];
+        memslot_npages[i] = memslot_npages_local[i];
+        memslot_userptrs[i] = memslot_userptrs_local[i];
+    }
+
+    munmap(memslot_base_gfns, 4096);
+    munmap(memslot_npages, 4096);
+    munmap(memslot_userptrs, 4096);
+    close(memslots_base_gfns_fd);
+    close(memslots_npages_fd);
+    close(memslots_userptrs_fd);
+    return 0;
+}
+
+
+
+/**
+ * Attaches and links hyperupcall to hook.
+ * 
+ * @cpu: CPUState
+ * @attrs: MemTxAttrs
+ * @hyperupcall_slot: hyperupcall slot that containers the hyperupcall object.
+ * @prog_name: physical address of buffer that containers the name of program to attach.
+ * @major_id: major ID of hook to attach.
+ * @minor_id: minor ID of hook to attach.
+ * @return hyperupcall program slot on success, -1 on failure.
+*/
+static int link_hyperupcall(CPUState *cpu, MemTxAttrs attrs, unsigned int hyperupcall_slot, char *guest_prog_name, unsigned long major_id, unsigned long minor_id) {
+    int program_slot, r = 0;
+    char prog_name[HYPERUPCALL_PROG_NAME_LEN];
+    struct bpf_program *prog = NULL;
+	struct bpf_link *link = NULL;
+    struct bpf_object *obj;
+    // struct bpf_tc_hook tc_hook = {0};
+    DECLARE_LIBBPF_OPTS(bpf_tc_hook, tc_hook, .ifindex =
+			    minor_id, .attach_point = BPF_TC_EGRESS);
+    LIBBPF_OPTS(bpf_tc_opts, tc_optl);
+    MemTxResult mtr;
+
+    if (hyperupcall_slot >= MAX_NUM_HYPERUPCALL_OBJS || hyperupcalls[hyperupcall_slot].obj == NULL) {
+        fprintf(stderr, "Invalid hyperupcall slot: %d\n", hyperupcall_slot);
+        return -1;
+    }
+    obj = hyperupcalls[hyperupcall_slot].obj;
+    
+    mtr = address_space_read(cpu->as, (hwaddr)guest_prog_name, MEMTXATTRS_UNSPECIFIED, prog_name, HYPERUPCALL_PROG_NAME_LEN);
+    if (mtr != MEMTX_OK) {
+        fprintf(stderr, "Couldn't read hyperupcall program name via address_space_read %d\n", mtr);
+        return -1;
+    }
+    prog_name[HYPERUPCALL_PROG_NAME_LEN - 1] = '\0';
+
+    program_slot = allocate_hyperupcall_prog_slot(&hyperupcalls[hyperupcall_slot]);
+    if (program_slot < 0) {
+        fprintf(stderr, "No free hyperupcall program slots\n");
+        return -1;
+    }
+
+    prog = bpf_object__find_program_by_name(obj, prog_name);
+	if (prog == NULL) {
+		fprintf(stderr, "Failed to find BPF program in file\n");
+		return -1;
+	}
+
+    switch(major_id) {
+        case HYPERUPCALL_MAJORID_XDP:
+            link = bpf_program__attach_xdp(prog, minor_id);
+            if (link == NULL) {
+                fprintf(stderr, "Failed to attach BPF XDP prog\n");
+                return -1;
+            }
+            break;
+        case HYPERUPCALL_MAJORID_PAGEFAULT:
+            if (minor_id == 0) {
+                link = bpf_program__attach_kprobe(prog, true, "alloc_bypass");
+                export_memslots_hyperupcall(obj);
+            }
+            else if (minor_id == 1)
+                link = bpf_program__attach_kprobe(prog, true, "update_mapping");
+            else
+                link = NULL;
+            if (link == NULL) {
+                fprintf(stderr, "Failed to attach BPF prog M: %lu m: %lu \n", major_id, minor_id);
+                return -1;
+            }
+            break;
+        case HYPERUPCALL_MAJORID_TC_EGRESS:
+            // tc_hook = (struct bpf_tc_hook){
+            //     .sz = sizeof(tc_hook),
+            //     .ifindex = minor_id,
+            //     .attach_point = BPF_TC_EGRESS | BPF_TC_INGRESS,
+            //     .parent = 1,
+            // };
+            r = bpf_tc_hook_create(&tc_hook);
+            if (r < 0) {
+                fprintf(stderr, "Failed to create BPF TC hook\n");
+                return -1;
+            }
+            
+            tc_optl.prog_fd = bpf_program__fd(prog);
+            tc_optl.flags = BPF_TC_F_REPLACE;
+            r = bpf_tc_attach(&tc_hook, &tc_optl);
+            if (r < 0) {
+                fprintf(stderr, "Failed to attach BPF TC prog\n");
+                bpf_tc_hook_destroy(&tc_hook);
+                return -1;
+            }
+            break;
+        case HYPERUPCALL_MAJORID_DIRECT_EXE:
+            if (minor_id == 0) {
+                link = bpf_program__attach_kprobe(prog, true, "sched_direct_exe");
+            }
+            if (link == NULL) {
+                fprintf(stderr, "Failed to attach BPF prog M: %lu m: %lu \n", major_id, minor_id);
+                return -1;
+            }
+            break;
+        default:
+            fprintf(stderr, "Invalid major id: %lu\n", major_id);
+            return -1;
+    }
+
+    // struct bpf_map* map = bpf_object__find_map_by_name(obj, "packets");
+	// if (!map) {
+	// 	fprintf(stderr, "Failed to find map 'packets'\n");
+	// } else {
+    //     for(int i = 0; i < 3; i++) {
+    //         unsigned int key = 0;
+    //         unsigned long long value = -1;
+    //         if (bpf_map__lookup_elem(map, &key, sizeof(key), &value, sizeof(value), 0) < 0) {
+    //             fprintf(stderr, "Failed to lookup key %u\n", key);
+    //         }
+    //         else {
+    //             fprintf(stderr, "key: %u, value: %llu\n", key, value);
+    //         }
+    //         sleep(3);
+    //     }
+    // }
+
+    hyperupcalls[hyperupcall_slot].links[program_slot] = link;
+    hyperupcalls[hyperupcall_slot].hooks[program_slot] = tc_hook;
+    hyperupcalls[hyperupcall_slot].progs[program_slot] = prog;
+    hyperupcalls[hyperupcall_slot].major_ids[program_slot] = major_id;
+    hyperupcalls[hyperupcall_slot].minor_ids[program_slot] = minor_id;
+    return program_slot;
+}
+
+
+/**
+ * Unlinks hyperupcall link from hook.
+*/
+static int unlink_hyperupcall(CPUState *cpu, unsigned int hyperupcall_slot, unsigned int program_slot) {
+    int r = 0;
+    if (hyperupcall_slot >= MAX_NUM_HYPERUPCALL_OBJS || hyperupcalls[hyperupcall_slot].obj == NULL) {
+        fprintf(stderr, "Invalid hyperupcall slot: %d\n", hyperupcall_slot);
+        return -1;
+    }
+
+    if (program_slot >= HYPERUPCALL_N_PROGRAM_SLOTS || hyperupcalls[hyperupcall_slot].progs[program_slot] == NULL) {
+        fprintf(stderr, "Invalid program slot: %d\n", program_slot);
+        return -1;
+    }
+
+    if (hyperupcalls[hyperupcall_slot].links[program_slot] != NULL) {
+	    bpf_link__destroy(hyperupcalls[hyperupcall_slot].links[program_slot]);
+        fprintf(stderr, "Link destroyed\n");
+    }
+    else if (hyperupcalls[hyperupcall_slot].hooks[program_slot].sz != 0) {
+        r = bpf_tc_hook_destroy(&hyperupcalls[hyperupcall_slot].hooks[program_slot]);
+        if (r < 0) {
+            fprintf(stderr, "Failed to destroy BPF TC hook\n");
+            return -1;
+        }
+        fprintf(stderr, "Hook destroyed\n");
+    }
+    else {
+        fprintf(stderr, "Error! No link or hook exist for these indices!\n");
+        return -1;
+    }
+
+    hyperupcalls[hyperupcall_slot].links[program_slot] = NULL;
+    hyperupcalls[hyperupcall_slot].hooks[program_slot] = (struct bpf_tc_hook){0};
+    hyperupcalls[hyperupcall_slot].progs[program_slot] = NULL;
+    hyperupcalls[hyperupcall_slot].major_ids[program_slot] = -1;
+    hyperupcalls[hyperupcall_slot].minor_ids[program_slot] = -1;
+    return 0;
+}
+
+
+/**
+ * Maps an eBPF map from a hyperupcall to memory pointed by map_ptr.
+ * TODO: fix memory leak
+ * 
+ * @cpu: CPUState
+ * @attrs: MemTxAttrs
+ * @hyperupcall_slot: hyperupcall slot that containers the hyperupcall object.
+ * @map_name: physical address of buffer that containers the name of map to attach.
+ * @map_ptr: physical address of physically contigous buffer that the eBPF map will be mapped to.
+*/
+static int map_hyperupcall_map(CPUState *cpu, MemTxAttrs attrs, unsigned int hyperupcall_slot, char *map_name_guest) {
+    Error *err = NULL;
+    void *mmapped_map;
+    int map_slot;
+    MemTxResult mtr;
+    Object *obj;
+    char mmaped_map_str[32];
+    char mmaped_map_size[32];
+    char map_name[HYPERUPCALL_PROG_NAME_LEN];
+
+    if (hyperupcall_slot >= MAX_NUM_HYPERUPCALL_OBJS || hyperupcalls[hyperupcall_slot].obj == NULL) {
+        fprintf(stderr, "Invalid hyperupcall slot: %d\n", hyperupcall_slot);
+        return -1;
+    }
+
+    map_slot = allocate_hyperupcall_map_slot();
+    if (map_slot == -1) {
+        fprintf(stderr, "No free hyperupcall map slots\n");
+        return -1;
+    }
+
+    mtr = address_space_read(cpu->as, (hwaddr)map_name_guest, MEMTXATTRS_UNSPECIFIED, map_name, HYPERUPCALL_PROG_NAME_LEN);
+    if (mtr != MEMTX_OK) {
+        fprintf(stderr, "Couldn't read hyperupcall map name via address_space_read %d\n", mtr);
+        return -1;
+    }
+    map_name[HYPERUPCALL_PROG_NAME_LEN - 1] = '\0';
+
+    struct bpf_map *map = bpf_object__find_map_by_name(hyperupcalls[hyperupcall_slot].obj, map_name);
+    if (map == NULL) {
+        fprintf(stderr, "Map not found: %s\n", map_name);
+        return -1;
+    }
+
+    int map_fd = bpf_map__fd(map);
+    if (map_fd < 0) {
+        fprintf(stderr, "Failed to get map file descriptor\n");
+        return -1;
+    }
+
+    mmapped_map = mmap(NULL, bpf_map__max_entries(map)*bpf_map__value_size(map), PROT_READ | PROT_WRITE, MAP_SHARED, map_fd, 0);
+	if (mmapped_map == MAP_FAILED) {
+		fprintf(stderr, "Failed to mmap ebpf map\n");
+        return -1;
+	}
+
+    /* Create object */
+    // Might need to add this to memfd: memory_region_init_ram_device_ptr(...)
+    sprintf(mmaped_map_str, "%p", mmapped_map);
+    sprintf(mmaped_map_size, "%d", (int)ROUND_UP(bpf_map__max_entries(map)*bpf_map__value_size(map), PAGE_SIZE));
+    fprintf(stderr, "mmapped_map size: %s\n", mmaped_map_size);
+    obj = object_new_with_props("memory-backend-memfd", object_get_objects_root(), memory_backend_names[map_slot], &err,
+        "size", mmaped_map_size,
+        "share", "true",
+        "prealloc", "true",
+        "user-ptr", mmaped_map_str,
+        NULL);
+
+    if (obj == NULL) {
+        fprintf(stderr, "object_new_with_props failed\n");
+        error_report_err(err);
+        munmap(mmapped_map, bpf_map__max_entries(map)*bpf_map__value_size(map));
+        return -1;
+    }
+
+    QDict *dev_qdict;
+
+    dev_qdict = qdict_new();
+    if (dev_qdict == NULL) {
+        fprintf(stderr, "qdict_new failed\n");
+        munmap(mmapped_map, bpf_map__max_entries(map)*bpf_map__value_size(map));
+        return -1;
+    }
+    qdict_put_str(dev_qdict, "driver", "ivshmem-plain");
+    qdict_put_str(dev_qdict, "bus", memory_backend_ids[map_slot]);
+    qdict_put_str(dev_qdict, "memdev", memory_backend_names[map_slot]);
+    qdict_put_str(dev_qdict, "id", memory_devices_names[map_slot]);
+    qemu_mutex_lock_iothread();
+    
+    qmp_device_add(dev_qdict, NULL, &err);
+    if (err != NULL) {
+        fprintf(stderr, "qmp_device_add failed\n");
+        error_report_err(err);
+        munmap(mmapped_map, bpf_map__max_entries(map)*bpf_map__value_size(map));
+        qemu_mutex_unlock_iothread();
+        return -1;
+    }
+    qemu_mutex_unlock_iothread();
+    hyperupcalls[hyperupcall_slot].mmaped_map_ptrs[map_slot] = mmapped_map;
+    hyperupcalls[hyperupcall_slot].maps[map_slot] = map;
+    fprintf(stderr, "added device\n");   
+    return map_slot;
+}
+
+static int unmap_hyperupcall_map_th(int hyperupcall_slot, int map_slot) {
+    int map_size;
+    Object *obj;
+    Error *err = NULL;
+    DeviceState *dev;
+    if (hyperupcall_slot >= MAX_NUM_HYPERUPCALL_OBJS || hyperupcalls[hyperupcall_slot].obj == NULL) {
+        fprintf(stderr, "Invalid hyperupcall slot: %d\n", hyperupcall_slot);
+        return -1;
+    }
+
+    if (map_slot >= HYPERUPCALL_N_MAP_SLOTS || hyperupcalls[hyperupcall_slot].maps[map_slot] == NULL) {
+        fprintf(stderr, "Invalid map slot: %d\n", map_slot);
+        return -1;
+    }
+
+    obj = object_resolve_path_at(container_get(qdev_get_machine(), "/peripheral"), memory_devices_names[map_slot]);
+    dev = (DeviceState *)object_dynamic_cast(obj, TYPE_DEVICE);
+    qdev_unplug(dev, &err);
+    if (err != NULL) {
+        fprintf(stderr, "qmp_device_del failed\n");
+        error_report_err(err);
+        return -1;
+    }
+
+    memory_backend_bh = memory_backend_names[map_slot];
+
+    map_size = bpf_map__max_entries(hyperupcalls[hyperupcall_slot].maps[map_slot]) * bpf_map__value_size(hyperupcalls[hyperupcall_slot].maps[map_slot]);
+    if (munmap(hyperupcalls[hyperupcall_slot].mmaped_map_ptrs[map_slot], map_size) < 0) {
+        fprintf(stderr, "munmap failed\n");
+        return -1;
+    }
+    free_hyperupcall_map_slot(map_slot);
+    return 0;
+}
+
+
+
+/**
+ * Unload hyperupcall from host. Unlinks all of its links.
+ * Called should hold the hyperupcall Lock
+ * 
+*/
+static int unload_hyperupcall(CPUState *cpu, unsigned int hyperupcall_slot) { 
+    if (hyperupcall_slot >= MAX_NUM_HYPERUPCALL_OBJS || hyperupcalls[hyperupcall_slot].obj == NULL) {
+        fprintf(stderr, "Invalid hyperupcall slot: %d\n", hyperupcall_slot);
+        return -1;
+    }
+
+    for (int i = 0; i < HYPERUPCALL_N_PROGRAM_SLOTS; i++) {
+        if (hyperupcalls[hyperupcall_slot].links[i] != NULL) {
+            unlink_hyperupcall(cpu, hyperupcall_slot, i);
+        }
+    }
+
+    for (int i = 0; i < HYPERUPCALL_N_MAP_SLOTS; i++) {
+        unmap_hyperupcall_map_th(hyperupcall_slot, i);
+    }
+
+    bpf_object__close(hyperupcalls[hyperupcall_slot].obj);
+
+    hyperupcalls[hyperupcall_slot].obj = NULL;
+    return 0;
+}
+
+
+struct map_update_attr {
+    char map_name[512];
+    unsigned int key;
+    size_t value_size;
+    bool is_set;
+    char value[0];
+};
+
+
+static int hyperupcall_map_elem_get_set(CPUState *cpu, unsigned int hyperupcall_slot, struct map_update_attr *usr_attr) {
+    struct bpf_map* map;
+    struct map_update_attr attr;
+    MemTxResult mtr;
+
+    int ret = 0;
+    if (hyperupcall_slot >= MAX_NUM_HYPERUPCALL_OBJS || hyperupcalls[hyperupcall_slot].obj == NULL) {
+        fprintf(stderr, "Invalid hyperupcall slot: %d\n", hyperupcall_slot);
+        return -1;
+    }
+
+    mtr = address_space_read(cpu->as, (hwaddr)usr_attr, MEMTXATTRS_UNSPECIFIED, &attr, sizeof(attr));
+    if (mtr != MEMTX_OK) {
+        fprintf(stderr, "Couldn't read hyperupcall update attributes via address_space_read %d\n", mtr);
+        return -1;
+    }
+
+    map = bpf_object__find_map_by_name(hyperupcalls[hyperupcall_slot].obj, attr.map_name);
+    if (!map) {
+        fprintf(stderr, "Failed to find map 'packets'\n");
+        return -1;
+    }
+
+    //read value
+    void *value = g_try_malloc0(attr.value_size);
+    if (value < 0) {
+        fprintf(stderr, "g_malloc0 failed\n");
+        return -1;
+    }
+
+    if (!attr.is_set) {
+        ret = bpf_map__lookup_elem(map, &attr.key, sizeof(attr.key), &attr.value, attr.value_size, 0);
+        if (ret < 0)
+            return ret;
+        
+        fprintf(stderr, "key: %u, value: %llu\n", attr.key, *(unsigned long long *)value);
+        mtr = address_space_write(cpu->as, (hwaddr)(usr_attr + 1), MEMTXATTRS_UNSPECIFIED, value, attr.value_size);
+        if (mtr != MEMTX_OK) {
+            fprintf(stderr, "Couldn't write hyperupcall map value via address_space_write %d\n", mtr);
+            ret = -1;
+        }
+
+        g_free(value);
+        return ret;
+    }
+
+    mtr = address_space_read(cpu->as, (hwaddr)attr.value, MEMTXATTRS_UNSPECIFIED, value, attr.value_size);
+    if (mtr != MEMTX_OK) {
+        fprintf(stderr, "Couldn't read hyperupcall map value via address_space_read %d\n", mtr);
+        g_free(value);
+        return -1;
+    }
+
+    ret = bpf_map__update_elem(map, &attr.key, sizeof(attr.key), &attr.value, attr.value_size, 0);
+    g_free(value);
+    return ret;
+}
+
+
+static int handle_hypercall(CPUState *cpu, MemTxAttrs attrs, unsigned long nr, unsigned long a0, unsigned long a1, unsigned long a2, unsigned long a3) {
+    int ret;
+    Error *err = NULL;
+    fprintf(stderr, "got hypercall nr %lu; args: %lu %lu %lu %lu\n", nr, a0, a1, a2, a3);
+
+    if (memory_backend_bh != NULL) {
+        qemu_mutex_lock_iothread();
+        if (user_creatable_del(memory_backend_bh, &err))
+            memory_backend_bh = NULL;
+        qemu_mutex_unlock_iothread();
+    }
+    if (memory_backend_bh != NULL) {
+        fprintf(stderr, "failed to delete memory_backend object: %s\n", memory_backend_bh);
+        error_report_err(err);
+    }
+    
+    switch(nr) {
+        case 13:
+            if (pthread_mutex_lock(&hyperupcalls_lock) != 0) {
+                fprintf(stderr, "pthread_mutex_lock failed\n");
+                return -1;
+            }
+            ret = load_hyperupcall(cpu, attrs, a0, a1);
+            pthread_mutex_unlock(&hyperupcalls_lock);
+            break;
+        case 14:
+            if (pthread_mutex_lock(&hyperupcalls_lock) != 0) {
+                fprintf(stderr, "pthread_mutex_lock failed\n");
+                return -1;
+            }
+            ret = unload_hyperupcall(cpu, a0);
+            pthread_mutex_unlock(&hyperupcalls_lock);
+            break;
+        case 15:
+            if (pthread_mutex_lock(&hyperupcalls_lock) != 0) {
+                fprintf(stderr, "pthread_mutex_lock failed\n");
+                return -1;
+            }
+            ret = link_hyperupcall(cpu, attrs, a0, (char *)a1, a2, a3);
+            pthread_mutex_unlock(&hyperupcalls_lock);
+            break;
+        case 16:
+            if (pthread_mutex_lock(&hyperupcalls_lock) != 0) {
+                fprintf(stderr, "pthread_mutex_lock failed\n");
+                return -1;
+            }
+            ret = unlink_hyperupcall(cpu, a0, a1);
+            pthread_mutex_unlock(&hyperupcalls_lock);
+            break;
+        case 17:
+            if (pthread_mutex_lock(&hyperupcalls_lock) != 0) {
+                fprintf(stderr, "pthread_mutex_lock failed\n");
+                return -1;
+            }
+            ret = map_hyperupcall_map(cpu, attrs, a0, (char *)a1);
+            pthread_mutex_unlock(&hyperupcalls_lock);
+            break;
+        case 18:
+            if (pthread_mutex_lock(&hyperupcalls_lock) != 0) {
+                fprintf(stderr, "pthread_mutex_lock failed\n");
+                return -1;
+            }
+            ret = unmap_hyperupcall_map_th(a0, a1);
+            pthread_mutex_unlock(&hyperupcalls_lock);
+            break;
+        case 19:
+            if (pthread_mutex_lock(&hyperupcalls_lock) != 0) {
+                fprintf(stderr, "pthread_mutex_lock failed\n");
+                return -1;
+            }
+            ret = hyperupcall_map_elem_get_set(cpu, a0, (struct map_update_attr *)a1);
+            pthread_mutex_unlock(&hyperupcalls_lock);
+            break;
+        default:
+            fprintf(stderr, "unknown hypercall number: %lu\n", nr);
+            ret = 0;
+            break;
+    }
+    return ret;
+}
+
+
 int kvm_cpu_exec(CPUState *cpu)
 {
     struct kvm_run *run = cpu->kvm_run;
-    int ret, run_ret;
+    int ret = 0, run_ret;
+    static int was_hyperupcall_init = 0;
 
     DPRINTF("kvm_cpu_exec()\n");
+    
+    if (was_hyperupcall_init == 0 && cpu->cpu_index == 0) {
+        memset(hyperupcalls, 0, sizeof(hyperupcalls));
+        ret = pthread_mutex_init(&hyperupcalls_lock, NULL);
+    }
+    if (was_hyperupcall_init == 0 && ret == 0) {
+        was_hyperupcall_init = 1;
+        fprintf(stderr, "\n Initialize hyperupcall lock \n"); 
+    }
+    else if (was_hyperupcall_init == 0) {
+        fprintf(stderr, "\n Couldn't initialize hyperupcall lock \n"); 
+        was_hyperupcall_init = -1;
+    }
+    ret = 0;
 
     if (kvm_arch_process_async_events(cpu)) {
         qatomic_set(&cpu->exit_request, 0);
@@ -2884,6 +3690,10 @@ int kvm_cpu_exec(CPUState *cpu)
 
         trace_kvm_run_exit(cpu->cpu_index, run->exit_reason);
         switch (run->exit_reason) {
+        case KVM_EXIT_HYPERCALL:
+            run->hypercall.ret = handle_hypercall(cpu, attrs, run->hypercall.nr, run->hypercall.args[0], run->hypercall.args[1], run->hypercall.args[2], run->hypercall.args[3]);
+            ret = 0;
+            break;
         case KVM_EXIT_IO:
             DPRINTF("handle_io\n");
             /* Called outside BQL */

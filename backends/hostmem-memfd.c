@@ -55,8 +55,15 @@ memfd_backend_memory_alloc(HostMemoryBackend *backend, Error **errp)
     name = host_memory_backend_get_name(backend);
     ram_flags = backend->share ? RAM_SHARED : 0;
     ram_flags |= backend->reserve ? 0 : RAM_NORESERVE;
-    memory_region_init_ram_from_fd(&backend->mr, OBJECT(backend), name,
-                                   backend->size, ram_flags, fd, 0, errp);
+    if (backend->user_ptr != 0) {
+        fprintf(stderr, "user_ptr: %p\n", backend->user_ptr);
+        memory_region_init_ram_device_ptr(&backend->mr, OBJECT(backend), name,
+                                   backend->size, backend->user_ptr);
+    }
+    else {
+        memory_region_init_ram_from_fd(&backend->mr, OBJECT(backend), name,
+                                    backend->size, ram_flags, fd, 0, errp);
+    }
     g_free(name);
 }
 

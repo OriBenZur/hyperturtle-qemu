@@ -465,6 +465,37 @@ host_memory_backend_set_use_canonical_path(Object *obj, bool value,
     backend->use_canonical_path = value;
 }
 
+static void host_memory_backend_get_user_ptr(Object *obj, Visitor *v, const char *name,
+                             void *opaque, Error **errp) {
+    HostMemoryBackend *backend = MEMORY_BACKEND(obj);
+    uint64_t value = backend->user_ptr;
+
+    visit_type_size(v, name, &value, errp);
+}
+
+static void host_memory_backend_set_user_ptr(Object *obj, Visitor *v, const char *name,
+                             void *opaque, Error **errp) {
+    HostMemoryBackend *backend = MEMORY_BACKEND(obj);
+    uint64_t value;
+
+    if (host_memory_backend_mr_inited(backend)) {
+        error_setg(errp, "cannot change property %s of %s ", name,
+                   object_get_typename(obj));
+        return;
+    }
+
+    if (!visit_type_size(v, name, &value, errp)) {
+        return;
+    }
+    if (!value) {
+        error_setg(errp,
+                   "property '%s' of %s doesn't take value '%" PRIu64 "'",
+                   name, object_get_typename(obj), value);
+        return;
+    }
+    backend->user_ptr = value;
+}
+
 static void
 host_memory_backend_class_init(ObjectClass *oc, void *data)
 {
@@ -521,6 +552,11 @@ host_memory_backend_class_init(ObjectClass *oc, void *data)
         host_memory_backend_get_share, host_memory_backend_set_share);
     object_class_property_set_description(oc, "share",
         "Mark the memory as private to QEMU or shared");
+    object_class_property_add(oc, "user-ptr", "int",
+        host_memory_backend_get_user_ptr, host_memory_backend_set_user_ptr,
+        NULL, NULL);
+    object_class_property_set_description(oc, "user-ptr",
+        "Pointer to user memory to map as buffer");
 #ifdef CONFIG_LINUX
     object_class_property_add_bool(oc, "reserve",
         host_memory_backend_get_reserve, host_memory_backend_set_reserve);

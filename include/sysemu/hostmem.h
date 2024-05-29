@@ -72,6 +72,7 @@ struct HostMemoryBackend {
     HostMemPolicy policy;
 
     MemoryRegion mr;
+    uint64_t user_ptr;
 };
 
 bool host_memory_backend_mr_inited(HostMemoryBackend *backend);
