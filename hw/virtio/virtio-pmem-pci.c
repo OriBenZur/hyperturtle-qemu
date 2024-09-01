@@ -29,7 +29,7 @@ static void virtio_pmem_pci_realize(VirtIOPCIProxy *vpci_dev, Error **errp)
 static void virtio_pmem_pci_set_addr(MemoryDeviceState *md, uint64_t addr,
                                      Error **errp)
 {
-    fprintf(stderr, "pmem set addr: %llx\n", addr);
+    fprintf(stderr, "pmem set addr: %ld\n", addr);
     object_property_set_uint(OBJECT(md), VIRTIO_PMEM_ADDR_PROP, addr, errp);
 }
 
