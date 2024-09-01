@@ -229,6 +229,8 @@ void show_netdevs(void);
 void net_init_clients(void);
 void net_check_clients(void);
 void net_cleanup(void);
+void print_available_netdevs(void);
+NetClientState *qemu_find_dev(const char *id);
 void hmp_host_net_add(Monitor *mon, const QDict *qdict);
 void hmp_host_net_remove(Monitor *mon, const QDict *qdict);
 void netdev_add(QemuOpts *opts, Error **errp);

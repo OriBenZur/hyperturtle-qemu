@@ -1,0 +1,23 @@
+##
+# @set_vdpa_mgmtdev:
+#
+# Sets the VDPA mgmt device for dynamically created netwoprk devices
+#
+# @name: the name of the VDPA mgmt devices. The device must exist in the system.
+#
+# Returns: Nothing on success
+#          If @name is not a valid network device, DeviceNotFound
+#
+# Since: 9.1.0
+#
+# Notes: Nothing
+#
+# Example:
+#
+# -> { "execute": "set_vdpa_mgmtdev",
+#      "arguments": { "name": "vdpa_net_sim" } # <- { "return": {} }
+#
+##
+
+{ 'command': 'set_vdpa_mgmtdev', 'data': {'name': 'str' }}
+

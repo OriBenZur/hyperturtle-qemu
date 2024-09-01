@@ -30,6 +30,7 @@ qapi_all_modules = [
   'common',
   'compat',
   'control',
+  'dynnet',
   'crypto',
   'dump',
   'error',

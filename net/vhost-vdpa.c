@@ -27,20 +27,6 @@
 #include "standard-headers/linux/virtio_net.h"
 #include "monitor/monitor.h"
 #include "hw/virtio/vhost.h"
-
-/* Todo:need to add the multiqueue support here */
-typedef struct VhostVDPAState {
-    NetClientState nc;
-    struct vhost_vdpa vhost_vdpa;
-    VHostNetState *vhost_net;
-
-    /* Control commands shadow buffers */
-    void *cvq_cmd_out_buffer;
-    virtio_net_ctrl_ack *status;
-
-    bool started;
-} VhostVDPAState;
-
 const int vdpa_feature_bits[] = {
     VIRTIO_F_NOTIFY_ON_EMPTY,
     VIRTIO_RING_F_INDIRECT_DESC,
@@ -155,7 +141,7 @@ err_init:
     return -1;
 }
 
-static void vhost_vdpa_cleanup(NetClientState *nc)
+void vhost_vdpa_cleanup(NetClientState *nc)
 {
     VhostVDPAState *s = DO_UPCAST(VhostVDPAState, nc, nc);
     struct vhost_dev *dev = &s->vhost_net->dev;

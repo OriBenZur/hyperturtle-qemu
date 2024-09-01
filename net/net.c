@@ -57,6 +57,8 @@
 #include "qapi/string-output-visitor.h"
 #include "qapi/qobject-input-visitor.h"
 
+char* VDPA_MGMTDEV_NAME = NULL;
+
 /* Net bridge is currently not supported for W32. */
 #if !defined(_WIN32)
 # define CONFIG_NET_BRIDGE
@@ -77,6 +79,27 @@ static NetdevQueue nd_queue = QSIMPLEQ_HEAD_INITIALIZER(nd_queue);
 
 /***********************************************************/
 /* network device redirectors */
+
+
+void qmp_set_vdpa_mgmtdev(const char *name, Error **errp) {
+    if (VDPA_MGMTDEV_NAME) {
+        // name is already set.
+        error_setg(errp, "vdpa management device name already set. Aborting.");
+        return;
+    }
+    
+    unsigned int buf_size = strlen(name) + 1;
+    
+    VDPA_MGMTDEV_NAME = malloc (buf_size);
+    if(! VDPA_MGMTDEV_NAME) {
+        error_setg(errp, "failed to allocate buffer for vdpa mgmtdev name. Aborting.");
+        return;
+    }
+
+    if (! strncpy(VDPA_MGMTDEV_NAME, name, sizeof(*VDPA_MGMTDEV_NAME))) {
+        error_setg(errp, "Failure during strncpy.");
+    }
+}
 
 int convert_host_port(struct sockaddr_in *saddr, const char *host,
                       const char *port, Error **errp)
@@ -853,6 +876,30 @@ qemu_sendv_packet(NetClientState *nc, const struct iovec *iov, int iovcnt)
     return qemu_sendv_packet_async(nc, iov, iovcnt, NULL);
 }
 
+void print_available_netdevs(void)
+{
+    NetClientState *nc;
+
+    QTAILQ_FOREACH(nc, &net_clients, next) {
+        fprintf(stderr, "netdev available: %s type %d\n", nc->name, nc->info->type);
+    }
+}
+
+NetClientState *qemu_find_dev(const char *id)
+{
+    NetClientState *nc;
+
+    QTAILQ_FOREACH(nc, &net_clients, next) {
+        if (!strcmp(nc->name, id)) {
+            return nc;
+        }
+    }
+
+    return NULL;
+}
+
+
+
 NetClientState *qemu_find_netdev(const char *id)
 {
     NetClientState *nc;
@@ -1091,7 +1138,7 @@ static int net_client_init1(const Netdev *netdev, bool is_netdev, Error **errp)
         error_setg(errp, "Duplicate ID '%s'", netdev->id);
         return -1;
     }
-
+    fprintf(stderr, "creating new interface with id: %s\n", netdev->id);
     if (net_client_init_fun[netdev->type](netdev, netdev->id, peer, errp) < 0) {
         /* FIXME drop when all init functions store an Error */
         if (errp && !*errp) {
@@ -1195,7 +1242,9 @@ static int net_client_init(QemuOpts *opts, bool is_netdev, Error **errp)
     if (!is_netdev && !qemu_opts_id(opts)) {
         qemu_opts_set_id(opts, id_generate(ID_NET));
     }
-
+    if(object) {
+        fprintf(stderr, "creating new interface with id: %s\n", object->id);
+    }
     if (visit_type_Netdev(v, NULL, &object, errp)) {
         ret = net_client_init1(object, is_netdev, errp);
     }

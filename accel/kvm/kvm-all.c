@@ -16,11 +16,14 @@
 #include "qemu/osdep.h"
 #include <sys/ioctl.h>
 #include <poll.h>
-
+#include <errno.h>
 #include <linux/kvm.h>
 #include <linux/bpf.h>
 #include <bpf/libbpf.h>
 #include "monitor/qdev.h"
+#include "monitor/hmp.h"
+#include "monitor/monitor.h"
+#include "vdpa-helpers.h"
 
 #include "qemu/atomic.h"
 #include "qemu/option.h"
@@ -39,6 +42,12 @@
 #include "exec/ram_addr.h"
 #include "qemu/event_notifier.h"
 #include "qemu/main-loop.h"
+#include "qemu/typedefs.h"
+#include "net/vhost_net.h"
+#include "net/vhost-vdpa.h"
+#include "net/clients.h"
+#include "net/net.h"
+#include "net/hub.h"
 #include "trace.h"
 #include "hw/irq.h"
 #include "qapi/visitor.h"
@@ -56,6 +65,15 @@
 #include "qapi/qmp/qdict.h"
 #include "include/hw/qdev-core.h"
 #include "include/qom/object_interfaces.h"
+
+struct Error
+{
+    char *msg;
+    ErrorClass err_class;
+    const char *src, *func;
+    int line;
+    GString *hint;
+};
 
 /* This check must be after config-host.h is included */
 #ifdef CONFIG_EVENTFD
@@ -163,7 +181,7 @@ enum {
 
 /**
  * Struct to hold hyperupcall information. Temporarily holds one link.
- * 
+ *
  * @obj: BPF object.
  * @nr_attachments: number of BPF programs.
  * @links: array of BPF link ptrs.
@@ -171,7 +189,7 @@ enum {
  * @progs: array of BPF program ptrs. progs[i] holds the program for links[i]. Duplicates may occur.
  * @major_ids: array of major IDs.
  * @minor_ids: array of minor IDs.
- * 
+ *
  * @lock: lock to protect hyperupcall struct. Currently not in use - use global hyperupcalls_lock instead.
 */
 struct HyperUpCall {
@@ -183,7 +201,7 @@ struct HyperUpCall {
     int minor_ids[HYPERUPCALL_N_PROGRAM_SLOTS];
     void *mmaped_map_ptrs[HYPERUPCALL_N_MAP_SLOTS];
     struct bpf_map *maps[HYPERUPCALL_N_MAP_SLOTS];
-    
+
 
     pthread_mutex_t lock;
 };
@@ -3059,7 +3077,7 @@ static int load_hyperupcall(CPUState *cpu, MemTxAttrs attrs, unsigned long progr
 
 static int export_memslots_hyperupcall(struct bpf_object *obj) {
     int memslots_base_gfns_fd, memslots_npages_fd, memslots_userptrs_fd;
-    unsigned long long *memslot_base_gfns, *memslot_npages, *memslot_userptrs; 
+    unsigned long long *memslot_base_gfns, *memslot_npages, *memslot_userptrs;
     struct bpf_map* memslot_base_gfns_map, *memslot_npages_map, *memslot_userptrs_map;
 
     memslot_base_gfns_map = bpf_object__find_map_by_name(obj, "l0_memslots_base_gfns");
@@ -3105,11 +3123,128 @@ static int export_memslots_hyperupcall(struct bpf_object *obj) {
     return 0;
 }
 
+/**
+ * Create vdpa interface and hotplug it into the vm
+ *
+ */
+
+
+enum VDPA_CMD {
+    VDPA_INVALID = 0,
+    VDPA_CREATE = 1,
+    VDPA_DESTOY = 2,
+};
+
+static int create_vdpa_and_hotplug(CPUState *cpu, MemTxAttrs attrs, unsigned int cmd, unsigned int interface_id) {
+    Monitor* mon = monitor_cur();
+    if (cmd == VDPA_DESTOY) {
+        const char* id_template = "Nvdpa-n";
+        char* id  = malloc(8);
+
+        strncpy(id, id_template, 8);
+        id[6] = interface_id + '0';
+        NetClientState* dev = qemu_find_dev(id);
+
+        if (dev == NULL) {
+            fprintf(stderr, "netdev with id %s does not exists. Aborting.", id);
+            return -1;
+        }
+
+        Error *err = NULL;
+        QDict *dev_qdict;
+
+        dev_qdict = qdict_new();
+        if (dev_qdict == NULL) {
+            fprintf(stderr, "qdict_new failed\n");
+            return -1;
+        }
+        qdict_put_str(dev_qdict, "driver", "virtio-net-pci");
+        qdict_put_str(dev_qdict, "id", id);
+        qdict_put_str(dev_qdict, "bus", "root");
+        qemu_mutex_lock_iothread();
+
+        hmp_device_del(mon, dev_qdict);
+        if (err != NULL) {
+            fprintf(stderr, "qmp_device_add failed\n");
+            error_report_err(err);
+            qemu_mutex_unlock_iothread();
+            return -1;
+        }
+        qemu_mutex_unlock_iothread();
+        dev = qemu_find_dev(id+sizeof(char));
+        qemu_del_net_client(dev);
+
+    } else if (cmd == VDPA_CREATE) {
+        // create vhost net
+        Netdev object = {0};
+        object.type = NET_CLIENT_DRIVER_VHOST_VDPA;
+
+        object.id = malloc(8);
+        char str[7] = "vdpa-n";
+        str[5] = interface_id + '0';
+        strncpy(object.id+sizeof(char), str, 7);
+        object.id[0] = 'N';
+        vdpa_create(interface_id);
+
+        const char* dev_path = "/dev/vhost-vdpa-0";
+
+        object.u.vhost_vdpa.vhostdev= malloc(18);
+        strncpy(object.u.vhost_vdpa.vhostdev, dev_path, 17);
+        object.u.vhost_vdpa.vhostdev[16] = interface_id + '0';
+        object.u.vhost_vdpa.vhostdev[17] = 0;
+
+
+        if (access(object.u.vhost_vdpa.vhostdev, F_OK) != 0) {
+            fprintf(stderr, "device %s does not exist on hypervisor\n", object.u.vhost_vdpa.vhostdev);
+            return -1;
+        }
+        object.u.vhost_vdpa.has_vhostdev = true;
+        object.u.vhost_vdpa.has_vhostfd = false;
+
+        NetClientState *peer = peer = net_hub_add_port(0, NULL, NULL);
+        if(qemu_find_netdev(object.id) != NULL) {
+            fprintf(stderr, "netdev with id %s already exists. Aborting.", object.id);
+            return -1;
+        }
+        Error *err = NULL;
+        net_init_vhost_vdpa(&object, str, peer, &err);
+        if(err != NULL) {
+            error_printf("failed to initialize vhost vda device: %s\n", err->msg);
+        }
+
+        // hotplug into vm
+    QDict *dev_qdict;
+
+    dev_qdict = qdict_new();
+    if (dev_qdict == NULL) {
+        fprintf(stderr, "qdict_new failed\n");
+        return -1;
+    }
+    qdict_put_str(dev_qdict, "driver", "virtio-net-pci");
+    qdict_put_str(dev_qdict, "id", object.id);
+    qdict_put_str(dev_qdict, "bus", "root/br");
+   // qdict_put_str(dev_qdict, "type", "vhost-vdpa");
+    qemu_mutex_lock_iothread();
+        // hmp_netdev_add(mon, dev_qdict);
+    qmp_device_add(dev_qdict, NULL, &err);
+    if (err != NULL) {
+        fprintf(stderr, "qmp_device_add failed\n");
+        error_report_err(err);
+        qemu_mutex_unlock_iothread();
+        return -1;
+    }
+    qemu_mutex_unlock_iothread();
+    } else {
+        fprintf(stderr, "Invalid vdpa command\n");
+        return -1;
+    }
+    return 0;
+}
 
 
 /**
  * Attaches and links hyperupcall to hook.
- * 
+ *
  * @cpu: CPUState
  * @attrs: MemTxAttrs
  * @hyperupcall_slot: hyperupcall slot that containers the hyperupcall object.
@@ -3135,7 +3270,7 @@ static int link_hyperupcall(CPUState *cpu, MemTxAttrs attrs, unsigned int hyperu
         return -1;
     }
     obj = hyperupcalls[hyperupcall_slot].obj;
-    
+
     mtr = address_space_read(cpu->as, (hwaddr)guest_prog_name, MEMTXATTRS_UNSPECIFIED, prog_name, HYPERUPCALL_PROG_NAME_LEN);
     if (mtr != MEMTX_OK) {
         fprintf(stderr, "Couldn't read hyperupcall program name via address_space_read %d\n", mtr);
@@ -3189,7 +3324,7 @@ static int link_hyperupcall(CPUState *cpu, MemTxAttrs attrs, unsigned int hyperu
                 fprintf(stderr, "Failed to create BPF TC hook\n");
                 return -1;
             }
-            
+
             tc_optl.prog_fd = bpf_program__fd(prog);
             tc_optl.flags = BPF_TC_F_REPLACE;
             r = bpf_tc_attach(&tc_hook, &tc_optl);
@@ -3283,7 +3418,7 @@ static int unlink_hyperupcall(CPUState *cpu, unsigned int hyperupcall_slot, unsi
 /**
  * Maps an eBPF map from a hyperupcall to memory pointed by map_ptr.
  * TODO: fix memory leak
- * 
+ *
  * @cpu: CPUState
  * @attrs: MemTxAttrs
  * @hyperupcall_slot: hyperupcall slot that containers the hyperupcall object.
@@ -3368,7 +3503,7 @@ static int map_hyperupcall_map(CPUState *cpu, MemTxAttrs attrs, unsigned int hyp
     qdict_put_str(dev_qdict, "memdev", memory_backend_names[map_slot]);
     qdict_put_str(dev_qdict, "id", memory_devices_names[map_slot]);
     qemu_mutex_lock_iothread();
-    
+
     qmp_device_add(dev_qdict, NULL, &err);
     if (err != NULL) {
         fprintf(stderr, "qmp_device_add failed\n");
@@ -3380,7 +3515,7 @@ static int map_hyperupcall_map(CPUState *cpu, MemTxAttrs attrs, unsigned int hyp
     qemu_mutex_unlock_iothread();
     hyperupcalls[hyperupcall_slot].mmaped_map_ptrs[map_slot] = mmapped_map;
     hyperupcalls[hyperupcall_slot].maps[map_slot] = map;
-    fprintf(stderr, "added device\n");   
+    fprintf(stderr, "added device\n");
     return map_slot;
 }
 
@@ -3424,9 +3559,9 @@ static int unmap_hyperupcall_map_th(int hyperupcall_slot, int map_slot) {
 /**
  * Unload hyperupcall from host. Unlinks all of its links.
  * Called should hold the hyperupcall Lock
- * 
+ *
 */
-static int unload_hyperupcall(CPUState *cpu, unsigned int hyperupcall_slot) { 
+static int unload_hyperupcall(CPUState *cpu, unsigned int hyperupcall_slot) {
     if (hyperupcall_slot >= MAX_NUM_HYPERUPCALL_OBJS || hyperupcalls[hyperupcall_slot].obj == NULL) {
         fprintf(stderr, "Invalid hyperupcall slot: %d\n", hyperupcall_slot);
         return -1;
@@ -3492,7 +3627,7 @@ static int hyperupcall_map_elem_get_set(CPUState *cpu, unsigned int hyperupcall_
         ret = bpf_map__lookup_elem(map, &attr.key, sizeof(attr.key), &attr.value, attr.value_size, 0);
         if (ret < 0)
             return ret;
-        
+
         fprintf(stderr, "key: %u, value: %llu\n", attr.key, *(unsigned long long *)value);
         mtr = address_space_write(cpu->as, (hwaddr)(usr_attr + 1), MEMTXATTRS_UNSPECIFIED, value, attr.value_size);
         if (mtr != MEMTX_OK) {
@@ -3532,7 +3667,7 @@ static int handle_hypercall(CPUState *cpu, MemTxAttrs attrs, unsigned long nr, u
         fprintf(stderr, "failed to delete memory_backend object: %s\n", memory_backend_bh);
         error_report_err(err);
     }
-    
+
     switch(nr) {
         case 13:
             if (pthread_mutex_lock(&hyperupcalls_lock) != 0) {
@@ -3590,6 +3725,14 @@ static int handle_hypercall(CPUState *cpu, MemTxAttrs attrs, unsigned long nr, u
             ret = hyperupcall_map_elem_get_set(cpu, a0, (struct map_update_attr *)a1);
             pthread_mutex_unlock(&hyperupcalls_lock);
             break;
+
+        /*
+         * Create vDPA interface and hotplug
+         */
+        case 23:
+            ret = create_vdpa_and_hotplug(cpu, attrs, a0, a1);
+            return 0;
+            break;
         default:
             fprintf(stderr, "unknown hypercall number: %lu\n", nr);
             ret = 0;
@@ -3606,17 +3749,17 @@ int kvm_cpu_exec(CPUState *cpu)
     static int was_hyperupcall_init = 0;
 
     DPRINTF("kvm_cpu_exec()\n");
-    
+
     if (was_hyperupcall_init == 0 && cpu->cpu_index == 0) {
         memset(hyperupcalls, 0, sizeof(hyperupcalls));
         ret = pthread_mutex_init(&hyperupcalls_lock, NULL);
     }
     if (was_hyperupcall_init == 0 && ret == 0) {
         was_hyperupcall_init = 1;
-        fprintf(stderr, "\n Initialize hyperupcall lock \n"); 
+        fprintf(stderr, "\n Initialize hyperupcall lock \n");
     }
     else if (was_hyperupcall_init == 0) {
-        fprintf(stderr, "\n Couldn't initialize hyperupcall lock \n"); 
+        fprintf(stderr, "\n Couldn't initialize hyperupcall lock \n");
         was_hyperupcall_init = -1;
     }
     ret = 0;
