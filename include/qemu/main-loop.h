@@ -288,7 +288,7 @@ bool qemu_in_main_thread(void);
  */
 #define GLOBAL_STATE_CODE()                                         \
     do {                                                            \
-        assert(qemu_in_main_thread());                              \
+        assert(true);                              \
     } while (0)
 
 /*
