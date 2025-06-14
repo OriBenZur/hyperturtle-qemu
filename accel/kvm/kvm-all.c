@@ -19,7 +19,12 @@
 #include <errno.h>
 #include <linux/kvm.h>
 #include <linux/bpf.h>
+#include <linux/perf_event.h>
 #include <bpf/libbpf.h>
+#include <linux/hw_breakpoint.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
 #include "monitor/qdev.h"
 #include "monitor/hmp.h"
 #include "monitor/monitor.h"
@@ -175,13 +180,15 @@ enum {
     HYPERUPCALL_MAJORID_PAGEFAULT,
     HYPERUPCALL_MAJORID_TC_EGRESS,
     HYPERUPCALL_MAJORID_DIRECT_EXE,
+    HYPERUPCALL_MAJORID_TC_INGRESS,
+    HYPERUPCALL_MAJORID_PROFILING,
     HYPERUPCALL_MAJORID_MAX,
 };
 
 
 /**
  * Struct to hold hyperupcall information. Temporarily holds one link.
- *
+ * 
  * @obj: BPF object.
  * @nr_attachments: number of BPF programs.
  * @links: array of BPF link ptrs.
@@ -189,7 +196,7 @@ enum {
  * @progs: array of BPF program ptrs. progs[i] holds the program for links[i]. Duplicates may occur.
  * @major_ids: array of major IDs.
  * @minor_ids: array of minor IDs.
- *
+ * 
  * @lock: lock to protect hyperupcall struct. Currently not in use - use global hyperupcalls_lock instead.
 */
 struct HyperUpCall {
@@ -201,7 +208,7 @@ struct HyperUpCall {
     int minor_ids[HYPERUPCALL_N_PROGRAM_SLOTS];
     void *mmaped_map_ptrs[HYPERUPCALL_N_MAP_SLOTS];
     struct bpf_map *maps[HYPERUPCALL_N_MAP_SLOTS];
-
+    
 
     pthread_mutex_t lock;
 };
@@ -3077,7 +3084,7 @@ static int load_hyperupcall(CPUState *cpu, MemTxAttrs attrs, unsigned long progr
 
 static int export_memslots_hyperupcall(struct bpf_object *obj) {
     int memslots_base_gfns_fd, memslots_npages_fd, memslots_userptrs_fd;
-    unsigned long long *memslot_base_gfns, *memslot_npages, *memslot_userptrs;
+    unsigned long long *memslot_base_gfns, *memslot_npages, *memslot_userptrs; 
     struct bpf_map* memslot_base_gfns_map, *memslot_npages_map, *memslot_userptrs_map;
 
     memslot_base_gfns_map = bpf_object__find_map_by_name(obj, "l0_memslots_base_gfns");
@@ -3122,6 +3129,35 @@ static int export_memslots_hyperupcall(struct bpf_object *obj) {
     close(memslots_userptrs_fd);
     return 0;
 }
+
+static int set_perf_event(unsigned long sample_freq) {
+    int fd;
+    struct perf_event_attr attr = {0};
+
+    attr.type = PERF_TYPE_SOFTWARE;
+    attr.type = PERF_TYPE_HARDWARE;
+    attr.config = PERF_COUNT_HW_CPU_CYCLES;
+    attr.size = sizeof(attr);
+    attr.freq = 1;
+    attr.sample_freq = sample_freq;
+    attr.sample_type = PERF_SAMPLE_RAW;
+    attr.disabled = 1;
+    attr.inherit = 1;
+    attr.mmap = 1;
+    attr.comm = 1;
+    attr.task = 1;
+    attr.sample_id_all = 1;
+    attr.exclude_host = 1;
+    attr.mmap2 = 1;
+    
+    fd = syscall(SYS_perf_event_open, &attr, -1, 5, -1, PERF_FLAG_FD_CLOEXEC);
+    if (fd < 0) {
+        perror("Failed to open perf event");
+        return -1;
+    }
+    return fd;
+}
+
 
 /**
  * Create vdpa interface and hotplug it into the vm
@@ -3244,7 +3280,7 @@ static int create_vdpa_and_hotplug(CPUState *cpu, MemTxAttrs attrs, unsigned int
 
 /**
  * Attaches and links hyperupcall to hook.
- *
+ * 
  * @cpu: CPUState
  * @attrs: MemTxAttrs
  * @hyperupcall_slot: hyperupcall slot that containers the hyperupcall object.
@@ -3254,7 +3290,7 @@ static int create_vdpa_and_hotplug(CPUState *cpu, MemTxAttrs attrs, unsigned int
  * @return hyperupcall program slot on success, -1 on failure.
 */
 static int link_hyperupcall(CPUState *cpu, MemTxAttrs attrs, unsigned int hyperupcall_slot, char *guest_prog_name, unsigned long major_id, unsigned long minor_id) {
-    int program_slot, r = 0;
+    int program_slot, perf_fd, r = 0;
     char prog_name[HYPERUPCALL_PROG_NAME_LEN];
     struct bpf_program *prog = NULL;
 	struct bpf_link *link = NULL;
@@ -3263,6 +3299,8 @@ static int link_hyperupcall(CPUState *cpu, MemTxAttrs attrs, unsigned int hyperu
     DECLARE_LIBBPF_OPTS(bpf_tc_hook, tc_hook, .ifindex =
 			    minor_id, .attach_point = BPF_TC_EGRESS);
     LIBBPF_OPTS(bpf_tc_opts, tc_optl);
+    tc_optl.priority = 1;
+    tc_optl.handle = 1;
     MemTxResult mtr;
 
     if (hyperupcall_slot >= MAX_NUM_HYPERUPCALL_OBJS || hyperupcalls[hyperupcall_slot].obj == NULL) {
@@ -3270,7 +3308,7 @@ static int link_hyperupcall(CPUState *cpu, MemTxAttrs attrs, unsigned int hyperu
         return -1;
     }
     obj = hyperupcalls[hyperupcall_slot].obj;
-
+    
     mtr = address_space_read(cpu->as, (hwaddr)guest_prog_name, MEMTXATTRS_UNSPECIFIED, prog_name, HYPERUPCALL_PROG_NAME_LEN);
     if (mtr != MEMTX_OK) {
         fprintf(stderr, "Couldn't read hyperupcall program name via address_space_read %d\n", mtr);
@@ -3312,6 +3350,9 @@ static int link_hyperupcall(CPUState *cpu, MemTxAttrs attrs, unsigned int hyperu
                 return -1;
             }
             break;
+        case HYPERUPCALL_MAJORID_TC_INGRESS:
+            tc_hook.attach_point = BPF_TC_INGRESS;
+            // fall through
         case HYPERUPCALL_MAJORID_TC_EGRESS:
             // tc_hook = (struct bpf_tc_hook){
             //     .sz = sizeof(tc_hook),
@@ -3324,7 +3365,7 @@ static int link_hyperupcall(CPUState *cpu, MemTxAttrs attrs, unsigned int hyperu
                 fprintf(stderr, "Failed to create BPF TC hook\n");
                 return -1;
             }
-
+            
             tc_optl.prog_fd = bpf_program__fd(prog);
             tc_optl.flags = BPF_TC_F_REPLACE;
             r = bpf_tc_attach(&tc_hook, &tc_optl);
@@ -3343,27 +3384,31 @@ static int link_hyperupcall(CPUState *cpu, MemTxAttrs attrs, unsigned int hyperu
                 return -1;
             }
             break;
+       case HYPERUPCALL_MAJORID_PROFILING:
+           perf_fd = set_perf_event(minor_id);
+           if (perf_fd < 0) {
+               fprintf(stderr, "Failed to set perf event");
+               return -1;
+           }
+           link = bpf_program__attach_perf_event(prog, perf_fd);
+           if (link == NULL) {
+               close(perf_fd);
+               perror("Failed to attach perf event");
+               return -1;
+           }
+
+           if (ioctl(perf_fd, PERF_EVENT_IOC_ENABLE, 0) < 0) {
+               close(perf_fd);
+               bpf_link__destroy(link);
+               perror("Failed to enable perf event");
+               return -1;
+           }
+           break;
+
         default:
             fprintf(stderr, "Invalid major id: %lu\n", major_id);
             return -1;
     }
-
-    // struct bpf_map* map = bpf_object__find_map_by_name(obj, "packets");
-	// if (!map) {
-	// 	fprintf(stderr, "Failed to find map 'packets'\n");
-	// } else {
-    //     for(int i = 0; i < 3; i++) {
-    //         unsigned int key = 0;
-    //         unsigned long long value = -1;
-    //         if (bpf_map__lookup_elem(map, &key, sizeof(key), &value, sizeof(value), 0) < 0) {
-    //             fprintf(stderr, "Failed to lookup key %u\n", key);
-    //         }
-    //         else {
-    //             fprintf(stderr, "key: %u, value: %llu\n", key, value);
-    //         }
-    //         sleep(3);
-    //     }
-    // }
 
     hyperupcalls[hyperupcall_slot].links[program_slot] = link;
     hyperupcalls[hyperupcall_slot].hooks[program_slot] = tc_hook;
@@ -3379,6 +3424,10 @@ static int link_hyperupcall(CPUState *cpu, MemTxAttrs attrs, unsigned int hyperu
 */
 static int unlink_hyperupcall(CPUState *cpu, unsigned int hyperupcall_slot, unsigned int program_slot) {
     int r = 0;
+    LIBBPF_OPTS(bpf_tc_opts, tc_optl);
+    tc_optl.handle = 1;
+    tc_optl.priority = 1;
+
     if (hyperupcall_slot >= MAX_NUM_HYPERUPCALL_OBJS || hyperupcalls[hyperupcall_slot].obj == NULL) {
         fprintf(stderr, "Invalid hyperupcall slot: %d\n", hyperupcall_slot);
         return -1;
@@ -3394,9 +3443,14 @@ static int unlink_hyperupcall(CPUState *cpu, unsigned int hyperupcall_slot, unsi
         fprintf(stderr, "Link destroyed\n");
     }
     else if (hyperupcalls[hyperupcall_slot].hooks[program_slot].sz != 0) {
+        r = bpf_tc_detach(&hyperupcalls[hyperupcall_slot].hooks[program_slot], &tc_optl);
+        if (r < 0) {
+            fprintf(stderr, "Failed to detach BPF TC prog %s\n", strerror(r));
+            return -1;
+        }
         r = bpf_tc_hook_destroy(&hyperupcalls[hyperupcall_slot].hooks[program_slot]);
         if (r < 0) {
-            fprintf(stderr, "Failed to destroy BPF TC hook\n");
+            fprintf(stderr, "Failed to destroy BPF TC hook %s\n", strerror(r));
             return -1;
         }
         fprintf(stderr, "Hook destroyed\n");
@@ -3418,7 +3472,7 @@ static int unlink_hyperupcall(CPUState *cpu, unsigned int hyperupcall_slot, unsi
 /**
  * Maps an eBPF map from a hyperupcall to memory pointed by map_ptr.
  * TODO: fix memory leak
- *
+ * 
  * @cpu: CPUState
  * @attrs: MemTxAttrs
  * @hyperupcall_slot: hyperupcall slot that containers the hyperupcall object.
@@ -3503,7 +3557,7 @@ static int map_hyperupcall_map(CPUState *cpu, MemTxAttrs attrs, unsigned int hyp
     qdict_put_str(dev_qdict, "memdev", memory_backend_names[map_slot]);
     qdict_put_str(dev_qdict, "id", memory_devices_names[map_slot]);
     qemu_mutex_lock_iothread();
-
+    
     qmp_device_add(dev_qdict, NULL, &err);
     if (err != NULL) {
         fprintf(stderr, "qmp_device_add failed\n");
@@ -3515,7 +3569,7 @@ static int map_hyperupcall_map(CPUState *cpu, MemTxAttrs attrs, unsigned int hyp
     qemu_mutex_unlock_iothread();
     hyperupcalls[hyperupcall_slot].mmaped_map_ptrs[map_slot] = mmapped_map;
     hyperupcalls[hyperupcall_slot].maps[map_slot] = map;
-    fprintf(stderr, "added device\n");
+    fprintf(stderr, "added device\n");   
     return map_slot;
 }
 
@@ -3559,9 +3613,9 @@ static int unmap_hyperupcall_map_th(int hyperupcall_slot, int map_slot) {
 /**
  * Unload hyperupcall from host. Unlinks all of its links.
  * Called should hold the hyperupcall Lock
- *
+ * 
 */
-static int unload_hyperupcall(CPUState *cpu, unsigned int hyperupcall_slot) {
+static int unload_hyperupcall(CPUState *cpu, unsigned int hyperupcall_slot) { 
     if (hyperupcall_slot >= MAX_NUM_HYPERUPCALL_OBJS || hyperupcalls[hyperupcall_slot].obj == NULL) {
         fprintf(stderr, "Invalid hyperupcall slot: %d\n", hyperupcall_slot);
         return -1;
@@ -3627,7 +3681,7 @@ static int hyperupcall_map_elem_get_set(CPUState *cpu, unsigned int hyperupcall_
         ret = bpf_map__lookup_elem(map, &attr.key, sizeof(attr.key), &attr.value, attr.value_size, 0);
         if (ret < 0)
             return ret;
-
+        
         fprintf(stderr, "key: %u, value: %llu\n", attr.key, *(unsigned long long *)value);
         mtr = address_space_write(cpu->as, (hwaddr)(usr_attr + 1), MEMTXATTRS_UNSPECIFIED, value, attr.value_size);
         if (mtr != MEMTX_OK) {
@@ -3667,7 +3721,7 @@ static int handle_hypercall(CPUState *cpu, MemTxAttrs attrs, unsigned long nr, u
         fprintf(stderr, "failed to delete memory_backend object: %s\n", memory_backend_bh);
         error_report_err(err);
     }
-
+    
     switch(nr) {
         case 13:
             if (pthread_mutex_lock(&hyperupcalls_lock) != 0) {
@@ -3749,17 +3803,17 @@ int kvm_cpu_exec(CPUState *cpu)
     static int was_hyperupcall_init = 0;
 
     DPRINTF("kvm_cpu_exec()\n");
-
+    
     if (was_hyperupcall_init == 0 && cpu->cpu_index == 0) {
         memset(hyperupcalls, 0, sizeof(hyperupcalls));
         ret = pthread_mutex_init(&hyperupcalls_lock, NULL);
     }
     if (was_hyperupcall_init == 0 && ret == 0) {
         was_hyperupcall_init = 1;
-        fprintf(stderr, "\n Initialize hyperupcall lock \n");
+        fprintf(stderr, "\n Initialize hyperupcall lock \n"); 
     }
     else if (was_hyperupcall_init == 0) {
-        fprintf(stderr, "\n Couldn't initialize hyperupcall lock \n");
+        fprintf(stderr, "\n Couldn't initialize hyperupcall lock \n"); 
         was_hyperupcall_init = -1;
     }
     ret = 0;
