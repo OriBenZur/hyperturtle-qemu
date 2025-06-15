@@ -24,6 +24,7 @@
 #include <linux/hw_breakpoint.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#include <net/if.h>
 
 #include "monitor/qdev.h"
 #include "monitor/hmp.h"
@@ -53,6 +54,7 @@
 #include "net/clients.h"
 #include "net/net.h"
 #include "net/hub.h"
+#include "net/tap.h"
 #include "trace.h"
 #include "hw/irq.h"
 #include "qapi/visitor.h"
@@ -63,6 +65,7 @@
 #include "sysemu/hw_accel.h"
 #include "kvm-cpus.h"
 #include "sysemu/dirtylimit.h"
+#include "net/tap_int.h"
 
 #include "hw/boards.h"
 #include "monitor/stats.h"
@@ -3158,6 +3161,19 @@ static int set_perf_event(unsigned long sample_freq) {
     return fd;
 }
 
+static int guest_netindex_to_ifindex(unsigned int guest_netindex) {
+    char ifname[128];
+    int ifindex;
+    NetClientState *nc = qemu_find_netdev_via_index(guest_netindex);
+
+    if (nc->info->type != NET_CLIENT_DRIVER_TAP) 
+        return -1;
+
+    tap_fd_get_ifname(tap_get_fd(nc), ifname);
+    ifindex = if_nametoindex(ifname);
+    return ifindex;
+}
+
 
 /**
  * Create vdpa interface and hotplug it into the vm
@@ -3297,7 +3313,7 @@ static int link_hyperupcall(CPUState *cpu, MemTxAttrs attrs, unsigned int hyperu
     struct bpf_object *obj;
     // struct bpf_tc_hook tc_hook = {0};
     DECLARE_LIBBPF_OPTS(bpf_tc_hook, tc_hook, .ifindex =
-			    minor_id, .attach_point = BPF_TC_EGRESS);
+			    guest_netindex_to_ifindex(minor_id), .attach_point = BPF_TC_EGRESS);
     LIBBPF_OPTS(bpf_tc_opts, tc_optl);
     tc_optl.priority = 1;
     tc_optl.handle = 1;
@@ -3330,7 +3346,7 @@ static int link_hyperupcall(CPUState *cpu, MemTxAttrs attrs, unsigned int hyperu
 
     switch(major_id) {
         case HYPERUPCALL_MAJORID_XDP:
-            link = bpf_program__attach_xdp(prog, minor_id);
+            link = bpf_program__attach_xdp(prog, guest_netindex_to_ifindex(minor_id));
             if (link == NULL) {
                 fprintf(stderr, "Failed to attach BPF XDP prog\n");
                 return -1;

@@ -915,6 +915,21 @@ NetClientState *qemu_find_netdev(const char *id)
     return NULL;
 }
 
+NetClientState *qemu_find_netdev_via_index(const unsigned int index)
+{
+    NetClientState *nc;
+    unsigned int i = 0;
+    QTAILQ_FOREACH(nc, &net_clients, next) {
+        if (nc->info->type == NET_CLIENT_DRIVER_NIC)
+            continue;
+        if (i++ == index) {
+            return nc;
+        }
+    }
+
+    return NULL;
+}
+
 int qemu_find_net_clients_except(const char *id, NetClientState **ncs,
                                  NetClientDriver type, int max)
 {
