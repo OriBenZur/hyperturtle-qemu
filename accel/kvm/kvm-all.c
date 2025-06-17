@@ -170,7 +170,6 @@ static QemuMutex kml_slots_lock;
 static void kvm_slot_init_dirty_bitmap(KVMSlot *mem);
 
 
-
 #define MAX_NUM_HYPERUPCALL_OBJS 16
 #define HYPERUPCALL_N_PROGRAM_SLOTS 8
 #define HYPERUPCALL_N_MAP_SLOTS 8
@@ -3664,61 +3663,64 @@ struct map_update_attr {
 
 
 static int hyperupcall_map_elem_get_set(CPUState *cpu, unsigned int hyperupcall_slot, struct map_update_attr *usr_attr) {
-    struct bpf_map* map;
-    struct map_update_attr attr;
-    MemTxResult mtr;
+    return -1;
+    // TODO: fix implementation
+    
+    // struct bpf_map* map;
+    // struct map_update_attr attr;
+    // MemTxResult mtr;
 
-    int ret = 0;
-    if (hyperupcall_slot >= MAX_NUM_HYPERUPCALL_OBJS || hyperupcalls[hyperupcall_slot].obj == NULL) {
-        fprintf(stderr, "Invalid hyperupcall slot: %d\n", hyperupcall_slot);
-        return -1;
-    }
+    // int ret = 0;
+    // if (hyperupcall_slot >= MAX_NUM_HYPERUPCALL_OBJS || hyperupcalls[hyperupcall_slot].obj == NULL) {
+    //     fprintf(stderr, "Invalid hyperupcall slot: %d\n", hyperupcall_slot);
+    //     return -1;
+    // }
 
-    mtr = address_space_read(cpu->as, (hwaddr)usr_attr, MEMTXATTRS_UNSPECIFIED, &attr, sizeof(attr));
-    if (mtr != MEMTX_OK) {
-        fprintf(stderr, "Couldn't read hyperupcall update attributes via address_space_read %d\n", mtr);
-        return -1;
-    }
+    // mtr = address_space_read(cpu->as, (hwaddr)usr_attr, MEMTXATTRS_UNSPECIFIED, &attr, sizeof(attr));
+    // if (mtr != MEMTX_OK) {
+    //     fprintf(stderr, "Couldn't read hyperupcall update attributes via address_space_read %d\n", mtr);
+    //     return -1;
+    // }
 
-    map = bpf_object__find_map_by_name(hyperupcalls[hyperupcall_slot].obj, attr.map_name);
-    if (!map) {
-        fprintf(stderr, "Failed to find map 'packets'\n");
-        return -1;
-    }
+    // map = bpf_object__find_map_by_name(hyperupcalls[hyperupcall_slot].obj, attr.map_name);
+    // if (!map) {
+    //     fprintf(stderr, "Failed to find map 'packets'\n");
+    //     return -1;
+    // }
 
-    //read value
-    void *value = g_try_malloc0(attr.value_size);
-    if (value < 0) {
-        fprintf(stderr, "g_malloc0 failed\n");
-        return -1;
-    }
+    // //read value
+    // void *value = g_try_malloc0(attr.value_size);
+    // if (value < 0) {
+    //     fprintf(stderr, "g_malloc0 failed\n");
+    //     return -1;
+    // }
 
-    if (!attr.is_set) {
-        ret = bpf_map__lookup_elem(map, &attr.key, sizeof(attr.key), &attr.value, attr.value_size, 0);
-        if (ret < 0)
-            return ret;
+    // if (!attr.is_set) {
+    //     ret = bpf_map__lookup_elem(map, &attr.key, sizeof(attr.key), &attr.value, attr.value_size, 0);
+    //     if (ret < 0)
+    //         return ret;
         
-        fprintf(stderr, "key: %u, value: %llu\n", attr.key, *(unsigned long long *)value);
-        mtr = address_space_write(cpu->as, (hwaddr)(usr_attr + 1), MEMTXATTRS_UNSPECIFIED, value, attr.value_size);
-        if (mtr != MEMTX_OK) {
-            fprintf(stderr, "Couldn't write hyperupcall map value via address_space_write %d\n", mtr);
-            ret = -1;
-        }
+    //     fprintf(stderr, "key: %u, value: %llu\n", attr.key, *(unsigned long long *)value);
+    //     mtr = address_space_write(cpu->as, (hwaddr)(usr_attr + 1), MEMTXATTRS_UNSPECIFIED, value, attr.value_size);
+    //     if (mtr != MEMTX_OK) {
+    //         fprintf(stderr, "Couldn't write hyperupcall map value via address_space_write %d\n", mtr);
+    //         ret = -1;
+    //     }
 
-        g_free(value);
-        return ret;
-    }
+    //     g_free(value);
+    //     return ret;
+    // }
 
-    mtr = address_space_read(cpu->as, (hwaddr)attr.value, MEMTXATTRS_UNSPECIFIED, value, attr.value_size);
-    if (mtr != MEMTX_OK) {
-        fprintf(stderr, "Couldn't read hyperupcall map value via address_space_read %d\n", mtr);
-        g_free(value);
-        return -1;
-    }
+    // mtr = address_space_read(cpu->as, (hwaddr)attr.value, MEMTXATTRS_UNSPECIFIED, value, attr.value_size);
+    // if (mtr != MEMTX_OK) {
+    //     fprintf(stderr, "Couldn't read hyperupcall map value via address_space_read %d\n", mtr);
+    //     g_free(value);
+    //     return -1;
+    // }
 
-    ret = bpf_map__update_elem(map, &attr.key, sizeof(attr.key), &attr.value, attr.value_size, 0);
-    g_free(value);
-    return ret;
+    // ret = bpf_map__update_elem(map, &attr.key, sizeof(attr.key), &attr.value, attr.value_size, 0);
+    // g_free(value);
+    // return ret;
 }
 
 
